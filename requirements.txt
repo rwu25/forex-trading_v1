@@ -1,0 +1,10 @@
+numpy
+pandas
+matplotlib
+seaborn
+scikit-learn
+yfinance
+ta
+tensorflow; platform_system == 'Linux'  # optional for MLP with Keras
+keras; platform_system == 'Linux'       # optional if using TensorFlow backend
+joblib
