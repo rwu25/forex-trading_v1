@@ -1,114 +1,128 @@
 """
-Berechnung technischer Indikatoren für Forex‑Zeitreihen.
+Technical indicator computations for Forex data.
 
-Dieses Modul nutzt primär das Paket `ta` für die gängigen Indikatoren.
-Falls `ta` nicht verfügbar ist, werden einfache Alternativen implementiert.
+This module provides a flexible ``compute_indicators`` function that
+calculates a variety of commonly used technical indicators.  In
+addition to the basic suite of moving averages, RSI, MACD and
+Bollinger bands, it also computes the Average True Range (ATR)
+and the Stochastic Oscillator.  The function works with a
+``pandas.DataFrame`` containing OHLCV data and returns a new
+DataFrame with the added indicator columns.
+
+The implementation does not rely on external libraries such as
+``ta``; instead, it uses straightforward Pandas operations.  This
+makes the code easy to audit and free from external dependencies.
+
+Examples
+--------
+>>> from .data_loader import load_forex_data
+>>> from .indicators import compute_indicators
+>>> df = load_forex_data("EURUSD=X", start="2020-01-01", end="2021-01-01")
+>>> df_ind = compute_indicators(df)
+>>> df_ind.columns
+Index([... 'SMA', 'EMA', 'RSI', 'MACD', 'MACD_Signal',
+       'Bollinger_Middle', 'Bollinger_Upper', 'Bollinger_Lower',
+       'ATR', 'Stoch_%K', 'Stoch_%D'],
+      dtype='object')
 """
 
 from __future__ import annotations
 
-import warnings
-from typing import Dict, Iterable, List, Optional, Tuple
-
 import pandas as pd
-
-try:
-    import ta  # type: ignore
-except ImportError:  # pragma: no cover
-    ta = None  # type: ignore
+import numpy as np
+from typing import Tuple, Iterable
 
 
 def compute_indicators(
     df: pd.DataFrame,
-    sma_windows: Iterable[int] = (10, 20, 50),
-    ema_windows: Iterable[int] = (10, 20),
-    rsi_windows: Iterable[int] = (14,),
-    bb_window: int = 20,
+    sma_window: int = 14,
+    ema_window: int = 14,
+    rsi_window: int = 14,
     macd_params: Tuple[int, int, int] = (12, 26, 9),
+    bollinger_window: int = 20,
+    bollinger_std: float = 2.0,
+    atr_window: int = 14,
+    stoch_params: Tuple[int, int] = (14, 3),
 ) -> pd.DataFrame:
-    """Berechne eine Auswahl technischer Indikatoren.
-
-    Zu jedem Indikator werden neue Spalten hinzugefügt.  Vorhandene Spalten
-    bleiben unverändert.
+    """Compute a suite of technical indicators.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Zeitreihe mit mindestens einer ``Close``‑Spalte.
-    sma_windows : iterable of int
-        Fensterlängen für einfache gleitende Durchschnitte.
-    ema_windows : iterable of int
-        Fensterlängen für exponentiell gleitende Durchschnitte.
-    rsi_windows : iterable of int
-        Fensterlängen für RSI.
-    bb_window : int
-        Fensterlänge für Bollinger‑Bänder.
-    macd_params : tuple of int
-        Parameter (fast, slow, signal) für den MACD.
+        DataFrame with at least ``Open``, ``High``, ``Low`` and ``Close`` columns.
+    sma_window : int, optional
+        Window size for the simple moving average (default 14).
+    ema_window : int, optional
+        Span for the exponential moving average (default 14).
+    rsi_window : int, optional
+        Window length for the Relative Strength Index (default 14).
+    macd_params : tuple of int, optional
+        Parameters ``(short_span, long_span, signal_span)`` for the MACD (default (12, 26, 9)).
+    bollinger_window : int, optional
+        Rolling window length for the Bollinger bands (default 20).
+    bollinger_std : float, optional
+        Number of standard deviations for Bollinger bands (default 2.0).
+    atr_window : int, optional
+        Window length for the Average True Range (default 14).
+    stoch_params : tuple of int, optional
+        Parameters ``(k_window, d_window)`` for the Stochastic Oscillator (default (14, 3)).
 
     Returns
     -------
     pd.DataFrame
-        Datenframe mit berechneten Indikatoren.
+        Copy of ``df`` with additional indicator columns.
+
+    Notes
+    -----
+    The function will not modify the input DataFrame in place.
+    Missing values will appear at the beginning of the series due
+    to rolling computations.  Users should handle missing values
+    before model training.
     """
-    df = df.copy()
-    close = df["Close"]
-    # Stelle sicher, dass `close` eine eindimensionale Series ist
-    if hasattr(close, "ndim") and close.ndim > 1:
-        close = close.iloc[:, 0]
-
-    # Simple Moving Averages (SMA)
-    for window in sma_windows:
-        df[f"SMA_{window}"] = close.rolling(window).mean()
-
-    # Exponential Moving Averages (EMA)
-    for window in ema_windows:
-        df[f"EMA_{window}"] = close.ewm(span=window, adjust=False).mean()
-
-    # Relative Strength Index (RSI)
-    for window in rsi_windows:
-        if ta:
-            indicator = ta.momentum.RSIIndicator(close, window=window)
-            df[f"RSI_{window}"] = indicator.rsi()
-        else:
-            # fallback einfache Berechnung
-            delta = close.diff()
-            gain = delta.clip(lower=0)
-            loss = -delta.clip(upper=0)
-            avg_gain = gain.rolling(window).mean()
-            avg_loss = loss.rolling(window).mean()
-            rs = avg_gain / avg_loss
-            df[f"RSI_{window}"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    fast, slow, signal = macd_params
-    if ta:
-        macd_indicator = ta.trend.MACD(close, window_slow=slow, window_fast=fast, window_sign=signal)
-        df["MACD"] = macd_indicator.macd()
-        df["MACD_Signal"] = macd_indicator.macd_signal()
-        df["MACD_Hist"] = macd_indicator.macd_diff()
-    else:
-        ema_fast = close.ewm(span=fast, adjust=False).mean()
-        ema_slow = close.ewm(span=slow, adjust=False).mean()
-        macd_line = ema_fast - ema_slow
-        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-        df["MACD"] = macd_line
-        df["MACD_Signal"] = signal_line
-        df["MACD_Hist"] = macd_line - signal_line
-
+    required_cols = {"Open", "High", "Low", "Close"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing required columns for indicator computation: {missing}")
+    data = df.copy()
+    # Simple Moving Average
+    data["SMA"] = data["Close"].rolling(window=sma_window).mean()
+    # Exponential Moving Average
+    data["EMA"] = data["Close"].ewm(span=ema_window, adjust=False).mean()
+    # Relative Strength Index
+    delta = data["Close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(window=rsi_window).mean()
+    avg_loss = loss.rolling(window=rsi_window).mean()
+    rs = avg_gain / avg_loss
+    data["RSI"] = 100.0 - (100.0 / (1.0 + rs))
+    # MACD and Signal
+    short_span, long_span, signal_span = macd_params
+    ema_short = data["Close"].ewm(span=short_span, adjust=False).mean()
+    ema_long = data["Close"].ewm(span=long_span, adjust=False).mean()
+    macd = ema_short - ema_long
+    signal = macd.ewm(span=signal_span, adjust=False).mean()
+    data["MACD"] = macd
+    data["MACD_Signal"] = signal
     # Bollinger Bands
-    if ta:
-        bb_indicator = ta.volatility.BollingerBands(close, window=bb_window, window_dev=2)
-        df["BB_High"] = bb_indicator.bollinger_hband()
-        df["BB_Low"] = bb_indicator.bollinger_lband()
-        df["BB_Mavg"] = bb_indicator.bollinger_mavg()
-        df["BB_Percent"] = bb_indicator.bollinger_pband()
-    else:
-        ma = close.rolling(bb_window).mean()
-        std = close.rolling(bb_window).std()
-        df["BB_Mavg"] = ma
-        df["BB_High"] = ma + 2 * std
-        df["BB_Low"] = ma - 2 * std
-        df["BB_Percent"] = (close - df["BB_Low"]) / (df["BB_High"] - df["BB_Low"])
-
-    return df
+    rolling_mean = data["Close"].rolling(window=bollinger_window).mean()
+    rolling_std = data["Close"].rolling(window=bollinger_window).std()
+    data["Bollinger_Middle"] = rolling_mean
+    data["Bollinger_Upper"] = rolling_mean + bollinger_std * rolling_std
+    data["Bollinger_Lower"] = rolling_mean - bollinger_std * rolling_std
+    # Average True Range
+    high = data["High"]
+    low = data["Low"]
+    close_prev = data["Close"].shift(1)
+    tr1 = high - low
+    tr2 = (high - close_prev).abs()
+    tr3 = (low - close_prev).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    data["ATR"] = tr.rolling(window=atr_window).mean()
+    # Stochastic Oscillator
+    k_window, d_window = stoch_params
+    low_min = data["Low"].rolling(window=k_window).min()
+    high_max = data["High"].rolling(window=k_window).max()
+    data["Stoch_%K"] = ((data["Close"] - low_min) / (high_max - low_min)) * 100.0
+    data["Stoch_%D"] = data["Stoch_%K"].rolling(window=d_window).mean()
+    return data

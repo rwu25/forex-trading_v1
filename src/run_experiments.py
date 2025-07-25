@@ -1,125 +1,160 @@
-"""
-Beispielszenario zum Vergleich von Machine‑Learning‑Modellen und
-klassischer technischer Analyse auf historischen Forex‑Daten.
-
-Dieses Skript kann direkt ausgeführt werden. Es lädt Devisendaten
-über `yfinance`, berechnet typische technische Indikatoren,
-erstellt eine binäre Zielvariable, trainiert mehrere ML‑Modelle und
-bewertet zudem eine einfache Moving‑Average‑Crossover‑Strategie.
-Die Ergebnisse werden als Tabelle ausgegeben.
-
-Hinweis: Für eine vollständige Analyse sollten die Daten zunächst
-lokal gecached oder in `data/` abgelegt werden, um API‑Limits zu
-vermeiden.
-"""
-
 from __future__ import annotations
 
+import os
 import argparse
 import pandas as pd
+from typing import Dict, Tuple
 
 from .data_loader import load_forex_data
 from .indicators import compute_indicators
+from .utils import create_target
 from .ml_models import train_classification_models
-from .evaluator import evaluate_classic_strategy, compare_models
-from .backtester import backtest_signals
-from .visualizer import plot_equity_curves, plot_metric_bars
+from .evaluator import generate_sma_signal, evaluate_strategy
+from .backtester import backtest_signals, compute_financial_metrics
 
 
-def main(
+def infer_train_test_dates(df: pd.DataFrame, train_ratio: float = 0.7) -> Tuple[str, str, str, str]:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("DataFrame index must be a DatetimeIndex to infer dates")
+    dates = df.index.sort_values()
+    n = len(dates)
+    split_idx = int(n * train_ratio)
+    start_train = dates[0].strftime("%Y-%m-%d")
+    end_train = dates[split_idx - 1].strftime("%Y-%m-%d")
+    start_test = dates[split_idx].strftime("%Y-%m-%d") if split_idx < n else dates[-1].strftime("%Y-%m-%d")
+    end_test = dates[-1].strftime("%Y-%m-%d")
+    return start_train, end_train, start_test, end_test
+
+
+def run_experiments(
     symbol: str,
-    train_start: str,
-    train_end: str,
-    test_start: str,
-    test_end: str,
-    short_window: int = 50,
-    long_window: int = 200,
-    tune: bool = False,
-    plot: bool = False,
+    start_date: str,
+    end_date: str,
+    output_dir: str,
+    train_start: str | None = None,
+    train_end: str | None = None,
+    test_start: str | None = None,
+    test_end: str | None = None,
+    transaction_cost: float = 0.0,
+    horizon: int = 1,
+    threshold: float = 0.0,
+    tune_rf: bool = False,
+    tune_mlp: bool = False,
+    tune_svm: bool = False,
+    tune_dt: bool = False,
+    tune_lr: bool = False,
+    cache_dir: str | None = None,
 ) -> None:
-    """Führe den erweiterten Analyseprozess für ein Devisenpaar aus.
+    os.makedirs(output_dir, exist_ok=True)
 
-    Lädt die Daten für den gesamten Zeitraum (Trainings- und Testbereich),
-    berechnet Indikatoren, trainiert ML‑Modelle mit einem zeitlichen
-    Split, bewertet eine SMA‑Strategie, vergleicht die Klassifikationsmetriken
-    und berechnet finanzielle Kennzahlen.  Optional werden Plots erzeugt.
-    """
-    overall_start = train_start
-    overall_end = test_end
-    print(f"Lade Daten für {symbol} von {overall_start} bis {overall_end}...")
-    df = load_forex_data(symbol=symbol, start=overall_start, end=overall_end)
+    print(f"Loading data for {symbol} from {start_date} to {end_date}...")
+    df = load_forex_data(symbol, start=start_date, end=end_date, cache_dir=cache_dir)
 
-    print("Berechne technische Indikatoren...")
+    print("Computing technical indicators...")
     df_ind = compute_indicators(df)
 
-    print("Trainiere Machine‑Learning‑Modelle (zeitlicher Split)...")
-    models, ml_metrics, predictions, probas = train_classification_models(
+    print("Creating target variable...")
+    df_ind["Target"] = create_target(df_ind, horizon=horizon, threshold=threshold, binary=True)
+    df_ind = df_ind.dropna()
+
+    if all(x is not None for x in (train_start, train_end, test_start, test_end)):
+        dates = (train_start, train_end, test_start, test_end)
+    else:
+        dates = infer_train_test_dates(df_ind, train_ratio=0.7)
+
+    start_train, end_train, start_test, end_test = dates
+    print(f"Training period: {start_train} to {end_train}")
+    print(f"Testing period: {start_test} to {end_test}")
+
+    print("Training machine-learning models...")
+    models, metrics_df, predictions, probas = train_classification_models(
         df_ind,
-        start_train=train_start,
-        end_train=train_end,
-        start_test=test_start,
-        end_test=test_end,
-        tune=tune,
+        start_train=start_train,
+        end_train=end_train,
+        start_test=start_test,
+        end_test=end_test,
+        tune_rf=tune_rf,
+        tune_mlp=tune_mlp,
+        tune_svm=tune_svm,
+        tune_dt=tune_dt,
+        tune_lr=tune_lr,
     )
 
-    print("Bewerte klassische SMA‑Strategie...")
-    classic_res = evaluate_classic_strategy(
-        df,
-        short_window=short_window,
-        long_window=long_window,
-        return_signals=True,
-        start_test=test_start,
-        end_test=test_end,
-    )
-    classic_metrics = {k: v for k, v in classic_res.items() if k != "Signals"}
-    classic_signals = classic_res.get("Signals", None)
+    print("Evaluating SMA crossover strategy...")
+    baseline_signal = generate_sma_signal(df_ind)
+    baseline_metrics = evaluate_strategy(baseline_signal, df_ind["Target"])
+    baseline_backtest = backtest_signals(baseline_signal, df_ind["Close"], transaction_cost)
+    baseline_financial = compute_financial_metrics(baseline_backtest["return"], freq=252)
 
-    print("Vergleiche Klassifikationsmetriken...")
-    results_classif = compare_models(ml_metrics, classic_metrics, save_path=None, plot=False)
-    print(results_classif)
+    financial_results: Dict[str, Dict[str, float]] = {}
+    for model_name, preds in predictions.items():
+        signal = preds.reindex(df_ind.index).fillna(0).astype(int)
+        backtest = backtest_signals(signal, df_ind["Close"], transaction_cost)
+        fin_metrics = compute_financial_metrics(backtest["return"], freq=252)
+        financial_results[model_name] = fin_metrics
 
-    print("Berechne finanzielle Kennzahlen...")
-    # Close-Spalte ggf. von DataFrame auf Series reduzieren
-    price_series = df["Close"]
-    if hasattr(price_series, "ndim") and price_series.ndim > 1:
-        price_series = price_series.iloc[:, 0]
-    price_series = price_series.loc[pd.to_datetime(test_start): pd.to_datetime(test_end)]
+    baseline_row = {"Model": "SMA_Crossover", **baseline_metrics}
+    metrics_df = pd.concat([
+        metrics_df,
+        pd.DataFrame([baseline_row])
+    ], ignore_index=True, sort=False).fillna(0)
 
-    signals_dict = {name: pred for name, pred in predictions.items()}
-    if classic_signals is not None:
-        signals_dict[f"SMA{short_window}/{long_window}"] = classic_signals
-    fin_metrics = backtest_signals(price_series, signals_dict)
-    fin_df = pd.DataFrame(fin_metrics).T
-    print(fin_df)
+    class_metrics_path = os.path.join(output_dir, "classification_metrics.csv")
+    metrics_df.to_csv(class_metrics_path, index=False)
+    print(f"Classification metrics saved to {class_metrics_path}")
 
-    if plot:
-        print("Erstelle Plots...")
-        output_dir = "results/plots"
-        plot_equity_curves(price_series, signals_dict, output_dir)
-        plot_metric_bars(results_classif, "F1", output_dir)
-        print(f"Plots gespeichert in {output_dir}")
+    fin_metrics_df = pd.DataFrame.from_dict(financial_results, orient="index")
+    fin_metrics_df.loc["SMA_Crossover"] = baseline_financial
+    fin_metrics_path = os.path.join(output_dir, "financial_metrics.csv")
+    fin_metrics_df.to_csv(fin_metrics_path)
+    print(f"Financial metrics saved to {fin_metrics_path}")
+
+    print("\nClassification Metrics:\n", metrics_df)
+    print("\nFinancial Metrics:\n", fin_metrics_df)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Forex ML vs. technische Analyse – erweiterte Version")
-    parser.add_argument("symbol", help="Devisenpaar, z. B. 'EURUSD=X'")
-    parser.add_argument("--train-start", dest="train_start", default="2018-01-01")
-    parser.add_argument("--train-end", dest="train_end", default="2022-12-31")
-    parser.add_argument("--test-start", dest="test_start", default="2023-01-01")
-    parser.add_argument("--test-end", dest="test_end", default="2024-12-31")
-    parser.add_argument("--short", type=int, default=50)
-    parser.add_argument("--long", type=int, default=200)
-    parser.add_argument("--tune", action="store_true")
-    parser.add_argument("--plot", action="store_true")
+def main():
+    parser = argparse.ArgumentParser(description="Run Forex trading experiments")
+    parser.add_argument("--symbol", type=str, required=True, help="Forex symbol (e.g., EURUSD=X)")
+    parser.add_argument("--start-date", type=str, required=True, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, required=True, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--output-dir", type=str, default="results", help="Directory for results")
+    parser.add_argument("--train-start", type=str, help="Training start date (YYYY-MM-DD)")
+    parser.add_argument("--train-end", type=str, help="Training end date (YYYY-MM-DD)")
+    parser.add_argument("--test-start", type=str, help="Testing start date (YYYY-MM-DD)")
+    parser.add_argument("--test-end", type=str, help="Testing end date (YYYY-MM-DD)")
+    parser.add_argument("--transaction-cost", type=float, default=0.0, help="Transaction cost per trade")
+    parser.add_argument("--horizon", type=int, default=1, help="Prediction horizon for target variable")
+    parser.add_argument("--threshold", type=float, default=0.0, help="Threshold for binary target")
+    parser.add_argument("--tune-rf", action="store_true", help="Tune RandomForest hyperparameters")
+    parser.add_argument("--tune-mlp", action="store_true", help="Tune MLP hyperparameters")
+    parser.add_argument("--tune-svm", action="store_true", help="Tune SVM hyperparameters")
+    parser.add_argument("--tune-dt", action="store_true", help="Tune Decision Tree hyperparameters")
+    parser.add_argument("--tune-lr", action="store_true", help="Tune Logistic Regression hyperparameters")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Optional directory to cache downloaded data")
+
     args = parser.parse_args()
-    main(
+
+    run_experiments(
         symbol=args.symbol,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        output_dir=args.output_dir,
         train_start=args.train_start,
         train_end=args.train_end,
         test_start=args.test_start,
         test_end=args.test_end,
-        short_window=args.short,
-        long_window=args.long,
-        tune=args.tune,
-        plot=args.plot,
+        transaction_cost=args.transaction_cost,
+        horizon=args.horizon,
+        threshold=args.threshold,
+        tune_rf=args.tune_rf,
+        tune_mlp=args.tune_mlp,
+        tune_svm=args.tune_svm,
+        tune_dt=args.tune_dt,
+        tune_lr=args.tune_lr,
+        cache_dir=args.cache_dir,
     )
+
+
+if __name__ == "__main__":
+    main()

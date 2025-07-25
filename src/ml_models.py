@@ -1,11 +1,43 @@
 """
-Training und Evaluation von Machine‑Learning‑Modellen für Forex‑Daten.
+Training and evaluation of machine‑learning models for Forex data.
 
-Dieses Modul stellt Funktionen bereit, um Klassifikationsmodelle wie
-Entscheidungsbäume, Random Forest, Support Vector Machine und MLP zu
-trainieren.  Die Modelle verwenden technische Indikatoren als
-Features und eine binäre Zielvariable (steigt der Kurs in den
-kommenden Perioden?).
+This module extends the original implementation by offering
+optional hyperparameter tuning for Support Vector Machines and
+Decision Trees, and by calculating additional evaluation metrics
+such as balanced accuracy and ROC‑AUC.  The core logic remains
+the same: a time‑based split separates training and testing
+periods, features are scaled based on the training set, and
+multiple models are trained on the same feature matrix.
+
+Parameters
+----------
+df : pandas.DataFrame
+    DataFrame with technical indicators and price columns.
+start_train, end_train : str
+    Start and end dates for the training period (inclusive).
+start_test, end_test : str
+    Start and end dates for the test period (inclusive).
+tune_rf, tune_mlp, tune_svm, tune_dt : bool, optional
+    Flags to indicate whether to perform grid search for the
+    respective models.  RandomForest and MLP have sensible
+    defaults; SVM and Decision Tree tuning is newly added.
+random_state : int
+    Random seed for reproducibility.
+
+Returns
+-------
+models : dict
+    Mapping from model name to trained estimator.
+metrics_df : pandas.DataFrame
+    Table of classification metrics (Accuracy, Precision,
+    Recall, F1, BalancedAccuracy, ROC_AUC) for each model.
+predictions : dict
+    Mapping from model name to a Series of predicted labels for
+    the test period.
+probas : dict
+    Mapping from model name to a Series of predicted class 1
+    probabilities for the test period, or ``None`` if not
+    available.
 """
 
 from __future__ import annotations
@@ -18,41 +50,36 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
-from .utils import create_target, train_test_split_scaled
+from .utils import create_target
 
 
-def prepare_features(df: pd.DataFrame, dropna: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
-    """Bereite die Feature‑Matrix und Zielvariable aus dem DataFrame vor.
+def prepare_features(
+    df: pd.DataFrame, dropna: bool = True
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """Prepare the feature matrix and target variable from the DataFrame.
 
-    Alle Spalten außer *Close* und *Volume* werden als Features genutzt.
-    Fehlende Werte werden entfernt, wenn ``dropna`` wahr ist.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame mit Indikatoren.
-    dropna : bool
-        Falls ``True``, werden Zeilen mit fehlenden Werten verworfen.
-
-    Returns
-    -------
-    X : pd.DataFrame
-        Feature‑Matrix.
-    y : pd.Series
-        Binäre Zielvariable (Kurs steigt ja/nein).
+    All columns except ``Close``, ``Adj Close`` and ``Volume`` are used
+    as features.  Missing values can be dropped if ``dropna`` is True.
     """
     df = df.copy()
     y = create_target(df, horizon=1)
-    # Entferne letzte Zeile (Target ist NaN)
+    # Remove last row where the target is NaN
     df = df.iloc[:-1].copy()
     y = y.iloc[:-1]
     feature_cols = [col for col in df.columns if col not in {"Close", "Adj Close", "Volume"}]
     X = df[feature_cols]
     if dropna:
-        # Entferne Zeilen mit fehlenden Werten
         mask = X.notna().all(axis=1)
         X = X[mask]
         y = y[mask]
@@ -65,186 +92,215 @@ def train_classification_models(
     end_train: str,
     start_test: str,
     end_test: str,
-    tune: bool = False,
+    tune_rf: bool = False,
+    tune_mlp: bool = False,
+    tune_svm: bool = False,
+    tune_dt: bool = False,
+    tune_lr: bool = False,
     random_state: int = 42,
 ) -> Tuple[Dict[str, Any], pd.DataFrame, Dict[str, pd.Series], Dict[str, Optional[pd.Series]]]:
-    """Trainiere mehrere Klassifikationsmodelle auf einem zeitlich getrennten Split.
+    """Train multiple classification models with a time‑based split.
 
-    Diese Funktion teilt die Daten anhand des DatetimeIndex in einen
-    Trainings‑ und einen Testbereich auf.  Optional kann eine
-    Hyperparameter‑Suche mit ``GridSearchCV`` aktiviert werden.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame mit technischen Indikatoren und Kursdaten.
-    start_train, end_train : str
-        Start‑ und Enddatum für den Trainingszeitraum (inkl.).
-    start_test, end_test : str
-        Start‑ und Enddatum für den Testzeitraum (inkl.).
-    tune : bool, default False
-        Wenn ``True``, wird für RandomForest und MLP eine GridSearchCV
-        durchgeführt.
-    random_state : int
-        Zufallszustand für Reproduzierbarkeit.
-
-    Returns
-    -------
-    models : dict
-        Mapping Modellname -> trainierter Modellinstanz.
-    metrics_df : pd.DataFrame
-        Tabelle mit Klassifikationsmetriken je Modell.
-    predictions : dict
-        Mapping Modellname -> Vorhersageserie (0/1) für den Testzeitraum.
-    probas : dict
-        Mapping Modellname -> Wahrscheinlichkeit der Klasse 1 für den
-        Testzeitraum (sofern verfügbar, sonst ``None``).
+    The data is split into training and testing periods according to
+    the provided date ranges.  Optionally, hyperparameter tuning
+    via ``GridSearchCV`` can be performed for RandomForest, MLP,
+    SVM, DecisionTree and Logistic Regression models.  Standard scaling is applied
+    separately on the training and test sets.
     """
-    # Bereite Features und Ziel vor
+    # Prepare features and target
     X, y = prepare_features(df)
-    # Stelle sicher, dass der Index ein DatetimeIndex ist
+    # Ensure the index is datetime
     if not isinstance(X.index, pd.DatetimeIndex):
-        X = X.copy()
-        y = y.copy()
+        X = X.copy(); y = y.copy()
         X.index = pd.to_datetime(X.index)
         y.index = pd.to_datetime(y.index)
-    # Filtere nach Datumsbereichen
+    # Apply date filters
     mask_train = (X.index >= pd.to_datetime(start_train)) & (X.index <= pd.to_datetime(end_train))
     mask_test = (X.index >= pd.to_datetime(start_test)) & (X.index <= pd.to_datetime(end_test))
     X_train, y_train = X.loc[mask_train], y.loc[mask_train]
     X_test, y_test = X.loc[mask_test], y.loc[mask_test]
-
-    # Skaliere die Features basierend auf dem Training
+    # Standard scaling
     from sklearn.preprocessing import StandardScaler
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
-
+    # Setup cross‑validation
+    tscv = TimeSeriesSplit(n_splits=3)
     models: Dict[str, Any] = {}
     metrics_list: List[Dict[str, float]] = []
     predictions: Dict[str, pd.Series] = {}
     probas: Dict[str, Optional[pd.Series]] = {}
 
-    # Setup Cross‑Validation für Tuning (Zeitreihe)
-    tscv = TimeSeriesSplit(n_splits=3)
-
-    # 1. Decision Tree (keine Hyperparameter‑Suche)
+    # Decision Tree
     dt = DecisionTreeClassifier(random_state=random_state)
-    dt.fit(X_train_scaled, y_train)
+    if tune_dt:
+        param_grid_dt = {
+            "max_depth": [None, 5, 10],
+            "min_samples_split": [2, 5, 10],
+        }
+        grid_dt = GridSearchCV(dt, param_grid_dt, cv=tscv, scoring="f1", n_jobs=-1, verbose=0)
+        grid_dt.fit(X_train_scaled, y_train)
+        dt = grid_dt.best_estimator_
+    else:
+        dt.fit(X_train_scaled, y_train)
     models["DecisionTree"] = dt
     y_pred_dt = dt.predict(X_test_scaled)
     predictions["DecisionTree"] = pd.Series(y_pred_dt, index=y_test.index)
-    probas["DecisionTree"] = None
-    metrics_list.append(_evaluate_model("DecisionTree", dt, y_test, y_pred_dt))
+    proba_dt = None
+    try:
+        proba_arr = dt.predict_proba(X_test_scaled)[:, 1]
+        proba_dt = pd.Series(proba_arr, index=y_test.index)
+    except Exception:
+        proba_dt = None
+    probas["DecisionTree"] = proba_dt
+    metrics_list.append(_evaluate_model(
+        "DecisionTree", y_test, y_pred_dt, proba_dt
+    ))
 
-    # 2. RandomForest
+    # RandomForest
     rf = RandomForestClassifier(random_state=random_state)
-    if tune:
-        param_grid = {
+    if tune_rf:
+        param_grid_rf = {
             "n_estimators": [50, 100, 200],
             "max_depth": [None, 10, 20],
         }
-        grid = GridSearchCV(
-            rf,
-            param_grid,
-            cv=tscv,
-            scoring="f1",
-            n_jobs=-1,
-            verbose=0,
-        )
-        grid.fit(X_train_scaled, y_train)
-        rf = grid.best_estimator_
+        grid_rf = GridSearchCV(rf, param_grid_rf, cv=tscv, scoring="f1", n_jobs=-1, verbose=0)
+        grid_rf.fit(X_train_scaled, y_train)
+        rf = grid_rf.best_estimator_
     else:
         rf = RandomForestClassifier(n_estimators=100, random_state=random_state)
         rf.fit(X_train_scaled, y_train)
     models["RandomForest"] = rf
     y_pred_rf = rf.predict(X_test_scaled)
     predictions["RandomForest"] = pd.Series(y_pred_rf, index=y_test.index)
+    proba_rf = None
     try:
-        proba_rf = rf.predict_proba(X_test_scaled)[:, 1]
-        probas["RandomForest"] = pd.Series(proba_rf, index=y_test.index)
+        proba_arr = rf.predict_proba(X_test_scaled)[:, 1]
+        proba_rf = pd.Series(proba_arr, index=y_test.index)
     except Exception:
-        probas["RandomForest"] = None
-    metrics_list.append(_evaluate_model("RandomForest", rf, y_test, y_pred_rf))
+        proba_rf = None
+    probas["RandomForest"] = proba_rf
+    metrics_list.append(_evaluate_model(
+        "RandomForest", y_test, y_pred_rf, proba_rf
+    ))
 
-    # 3. Support Vector Machine
+    # SVM
     svm = SVC(kernel="rbf", probability=True, random_state=random_state)
-    svm.fit(X_train_scaled, y_train)
+    if tune_svm:
+        param_grid_svm = {
+            "C": [0.1, 1, 10],
+            "gamma": ["scale", "auto"],
+        }
+        grid_svm = GridSearchCV(svm, param_grid_svm, cv=tscv, scoring="f1", n_jobs=-1, verbose=0)
+        grid_svm.fit(X_train_scaled, y_train)
+        svm = grid_svm.best_estimator_
+    else:
+        svm.fit(X_train_scaled, y_train)
     models["SVM"] = svm
     y_pred_svm = svm.predict(X_test_scaled)
     predictions["SVM"] = pd.Series(y_pred_svm, index=y_test.index)
+    proba_svm = None
     try:
-        proba_svm = svm.predict_proba(X_test_scaled)[:, 1]
-        probas["SVM"] = pd.Series(proba_svm, index=y_test.index)
+        proba_arr = svm.predict_proba(X_test_scaled)[:, 1]
+        proba_svm = pd.Series(proba_arr, index=y_test.index)
     except Exception:
-        probas["SVM"] = None
-    metrics_list.append(_evaluate_model("SVM", svm, y_test, y_pred_svm))
+        proba_svm = None
+    probas["SVM"] = proba_svm
+    metrics_list.append(_evaluate_model(
+        "SVM", y_test, y_pred_svm, proba_svm
+    ))
 
-    # 4. MLP Neural Network
+    # MLP Neural Network
     mlp = MLPClassifier(max_iter=200, random_state=random_state)
-    if tune:
-        param_grid = {
+    if tune_mlp:
+        param_grid_mlp = {
             "hidden_layer_sizes": [(50,), (100,), (100, 50)],
             "activation": ["relu", "tanh"],
         }
-        grid = GridSearchCV(
-            mlp,
-            param_grid,
-            cv=tscv,
-            scoring="f1",
-            n_jobs=-1,
-            verbose=0,
-        )
-        grid.fit(X_train_scaled, y_train)
-        mlp = grid.best_estimator_
+        grid_mlp = GridSearchCV(mlp, param_grid_mlp, cv=tscv, scoring="f1", n_jobs=-1, verbose=0)
+        grid_mlp.fit(X_train_scaled, y_train)
+        mlp = grid_mlp.best_estimator_
     else:
         mlp = MLPClassifier(
-            hidden_layer_sizes=(64, 32),
-            activation="relu",
-            solver="adam",
-            max_iter=200,
-            random_state=random_state,
+            hidden_layer_sizes=(64, 32), activation="relu", solver="adam",
+            max_iter=200, random_state=random_state
         )
         mlp.fit(X_train_scaled, y_train)
     models["MLP"] = mlp
     y_pred_mlp = mlp.predict(X_test_scaled)
     predictions["MLP"] = pd.Series(y_pred_mlp, index=y_test.index)
+    proba_mlp = None
     try:
-        proba_mlp = mlp.predict_proba(X_test_scaled)[:, 1]
-        probas["MLP"] = pd.Series(proba_mlp, index=y_test.index)
+        proba_arr = mlp.predict_proba(X_test_scaled)[:, 1]
+        proba_mlp = pd.Series(proba_arr, index=y_test.index)
     except Exception:
-        probas["MLP"] = None
-    metrics_list.append(_evaluate_model("MLP", mlp, y_test, y_pred_mlp))
+        proba_mlp = None
+    probas["MLP"] = proba_mlp
+    metrics_list.append(_evaluate_model(
+        "MLP", y_test, y_pred_mlp, proba_mlp
+    ))
 
+    # Logistic Regression
+    # A linear model baseline that can offer well‑calibrated probabilities.
+    lr = LogisticRegression(max_iter=200, random_state=random_state, solver="lbfgs")
+    if tune_lr:
+        param_grid_lr = {
+            "C": [0.1, 1, 10],
+            "penalty": ["l2"],
+        }
+        grid_lr = GridSearchCV(lr, param_grid_lr, cv=tscv, scoring="f1", n_jobs=-1, verbose=0)
+        grid_lr.fit(X_train_scaled, y_train)
+        lr = grid_lr.best_estimator_
+    else:
+        lr.fit(X_train_scaled, y_train)
+    models["LogisticRegression"] = lr
+    y_pred_lr = lr.predict(X_test_scaled)
+    predictions["LogisticRegression"] = pd.Series(y_pred_lr, index=y_test.index)
+    proba_lr: Optional[pd.Series] = None
+    try:
+        proba_arr = lr.predict_proba(X_test_scaled)[:, 1]
+        proba_lr = pd.Series(proba_arr, index=y_test.index)
+    except Exception:
+        proba_lr = None
+    probas["LogisticRegression"] = proba_lr
+    metrics_list.append(_evaluate_model(
+        "LogisticRegression", y_test, y_pred_lr, proba_lr
+    ))
+
+    # Build DataFrame
     metrics_df = pd.DataFrame(metrics_list)
     return models, metrics_df, predictions, probas
 
 
-def _evaluate_model(name: str, model: object, y_true: pd.Series, y_pred: np.ndarray) -> Dict[str, float]:
-    """Berechne Klassifikationsmetriken für ein Modell.
+def _evaluate_model(
+    name: str,
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    proba: Optional[pd.Series],
+) -> Dict[str, float]:
+    """Compute classification metrics for a model.
 
-    Parameters
-    ----------
-    name : str
-        Modellname.
-    model : object
-        Modellinstanz (wird hier nicht direkt genutzt, aber für mögliche
-        Erweiterungen übergeben).
-    y_true : pd.Series
-        Tatsächliche Zielwerte.
-    y_pred : np.ndarray
-        Vorhergesagte Klassen.
-
-    Returns
-    -------
-    dict
-        Enthält Modellname, Accuracy, Precision, Recall und F1‑Score.
+    In addition to Accuracy, Precision, Recall and F1, this
+    extended evaluation also reports balanced accuracy and
+    ROC‑AUC (where probabilities are available).  If a probability
+    vector is not provided or only a single class is present,
+    ROC‑AUC will be set to ``np.nan``.
     """
-    return {
+    metrics: Dict[str, float] = {
         "Model": name,
         "Accuracy": accuracy_score(y_true, y_pred),
         "Precision": precision_score(y_true, y_pred, zero_division=0),
         "Recall": recall_score(y_true, y_pred, zero_division=0),
         "F1": f1_score(y_true, y_pred, zero_division=0),
+        "BalancedAccuracy": balanced_accuracy_score(y_true, y_pred),
+        "ROC_AUC": np.nan,
     }
+    if proba is not None:
+        try:
+            # ROC‑AUC only defined when both classes are present
+            if len(np.unique(y_true)) > 1:
+                metrics["ROC_AUC"] = roc_auc_score(y_true, proba)
+        except Exception:
+            metrics["ROC_AUC"] = np.nan
+    return metrics
